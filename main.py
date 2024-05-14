@@ -1,92 +1,132 @@
 import numpy as np
-from scipy.optimize import minimize
-import numba
-from numba import types
-from numba.core.types import StructRef
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
 
-# Define the Quaternion class
-class Quaternion:
-    def __init__(self, w, x, y, z):
-        self.w = w
-        self.x = x
-        self.y = y
-        self.z = z
+# Define the Quaternion Neural Network for Gyroscope Orientation
+class QuaternionNN(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim):
+        super(QuaternionNN, self).__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc3 = nn.Linear(hidden_dim, output_dim)
 
-    def __mul__(self, other):
-        w1, x1, y1, z1 = self.w, self.x, self.y, self.z
-        w2, x2, y2, z2 = other.w, other.x, other.y, other.z
-        w = w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2
-        x = w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2
-        y = w1 * y2 + y1 * w2 + z1 * x2 - x1 * z2
-        z = w1 * z2 + z1 * w2 + x1 * y2 - y1 * x2
-        return Quaternion(w, x, y, z)
+    def forward(self, x):
+        x = torch.relu(self.fc1(x))
+        x = torch.relu(self.fc2(x))
+        x = self.fc3(x)
+        return x
 
-    def conjugate(self):
-        return Quaternion(self.w, -self.x, -self.y, -self.z)
+# Custom loss function to maximize power generation from gyroscopes
+def power_loss(output, gravitational_field, n):
+    output = output.view(n, 4)
+    gravitational_field = gravitational_field.view(n, 4)
+    loss = -torch.sum(output * gravitational_field)
+    return loss
 
-    @property
-    def norm(self):
-        return np.sqrt(self.w ** 2 + self.x ** 2 + self.y ** 2 + self.z ** 2)
+# Define the dynamic gravitational field using a quaternion representation
+def dynamic_gravitational_field(coords, masses, distances, time_step):
+    G = 6.67430e-11  # gravitational constant
+    grav_field = np.zeros((coords.shape[0], 4))  # Initialize with shape (n, 4)
+    for i, coord in enumerate(coords):
+        r = np.linalg.norm(coord)
+        force_magnitude = sum([G * mass / (r ** 2) for mass in masses])
+        direction = np.concatenate((coord / r, [1.0]))  
+        grav_field[i] = force_magnitude * direction * np.array([np.cos(time_step), np.sin(time_step), 1, 1])
+    return grav_field
 
-    def __str__(self):
-        return f"{self.w} + {self.x}i + {self.y}j + {self.z}k"
+# Define the sphere and gyroscope orientations
+n = 100  # number of gyroscopes
+sphere_coords = np.random.rand(n, 3) * 2 - 1  # random positions in a unit sphere
+sphere_coords /= np.linalg.norm(sphere_coords, axis=1, keepdims=True)  # normalize to lie on the sphere
 
-# Register the custom numba type for the Quaternion class
-@numba.extending.register_model(Quaternion)
-class QuaternionModel(StructRef):
-    def __init__(self, dmm, fe_type):
-        members = [
-            ('w', types.float32),
-            ('x', types.float32),
-            ('y', types.float32),
-            ('z', types.float32),
-        ]
-        super().__init__(dmm, fe_type, members)
+# Initial gyroscope orientations (random quaternions)
+gyro_orientations = np.random.rand(n, 4) * 2 - 1
+gyro_orientations /= np.linalg.norm(gyro_orientations, axis=1, keepdims=True)
 
-numba.extending.make_extension_accepted_types(Quaternion)
+# Define masses and distances for different scales
+masses = {
+    'earth': 5.972e24,
+    'sun': 1.989e30,
+    'black_hole': 1.989e40  # large mass for black hole simulation
+}
+distances = {
+    'earth': 6.371e6,
+    'sun': 6.957e8,
+    'black_hole': 1e4  # close distance for black hole
+}
 
-# Define a quaternion space
-n = 100  # dimensionality of the space
-quatspace = np.zeros((n, n), dtype=object)
-for i in range(n):
-    for j in range(n):
-        quatspace[i, j] = Quaternion(i + j, 1, 0, 0)
+# Select scale to simulate
+scale = 'earth'  # change to 'sun' or 'black_hole' for other scales
+mass = masses[scale]
+distance = distances[scale]
 
-# Define a Riemann-Hilbert operator
-@numba.jit(nopython=True)
-def rh_operator(quat):
-    one = Quaternion(1.0, 0.0, 0.0, 0.0)  # Create a quaternion object for 1
-    return quat * (quat.conjugate() - one) / (quat.norm() ** 2)
+# Initialize the neural network
+input_dim = 4  # quaternion
+hidden_dim = 64
+output_dim = 4  # quaternion
+model = QuaternionNN(input_dim, hidden_dim, output_dim)
 
-# Apply the Riemann-Hilbert operator to the quaternion space
-rh_space = np.zeros((n * n, 4))
-for idx, (i, j) in enumerate(np.ndindex(n, n)):
-    quat = rh_operator(quatspace[i, j])
-    rh_space[idx, :] = np.array([quat.w, quat.x, quat.y, quat.z])
+# Define the optimizer
+optimizer = optim.Adam(model.parameters(), lr=0.001)
 
-# Define the Yang-Mills functional
-@numba.jit(nopython=True)
-def yang_mills_functional(A_flat):
-    A = A_flat.reshape(n, n, 4)  # Reshape to (n, n, 4)
-    A_conj_T = A.swapaxes(0, 1).conj()  # Explicitly take the conjugate transpose
-    return np.sum((A - A_conj_T) ** 2)
+# Training loop with dynamic gravitational field
+num_epochs = 1000
+time_step = 0
+for epoch in range(num_epochs):
+    model.train()
+    
+    # Update time step for dynamic field
+    time_step += 0.01
+    
+    # Calculate dynamic gravitational field
+    grav_field = dynamic_gravitational_field(sphere_coords, [mass], [distance], time_step)
+    grav_field_tensor = torch.tensor(grav_field, dtype=torch.float32)
+    
+    # Convert to PyTorch tensors
+    sphere_coords_tensor = torch.tensor(sphere_coords, dtype=torch.float32)
+    gyro_orientations_tensor = torch.tensor(gyro_orientations, dtype=torch.float32)
+    
+    # Forward pass
+    output = model(gyro_orientations_tensor)
+    
+    # Compute the loss
+    loss = power_loss(output, grav_field_tensor, n)
+    
+    # Backward pass and optimization
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+    
+    if (epoch+1) % 100 == 0:
+        print(f'Epoch [{epoch+1}/{num_epochs}], Loss: {loss.item():.4f}')
 
-# Initialize the guess for the Yang-Mills field
-A_guess = np.random.rand(n, n, 4)
+# Example of using the trained model
+model.eval()
+with torch.no_grad():
+    example_gyro = torch.tensor([[1, 0, 0, 0]], dtype=torch.float32)
+    output_orientation = model(example_gyro)
+    print(f"Gyroscope orientation result: {output_orientation.numpy()}")
 
-# Minimize the Yang-Mills functional using scipy.optimize.minimize
-result = minimize(yang_mills_functional, A_guess.flatten(), method='L-BFGS-B')
+# Visualization
+def plot_universe(black_holes, other_objects):
+    fig = plt.figure()
+    ax = fig.add_subplot(111, projection='3d')
+    ax.scatter(black_holes[:, 0], black_holes[:, 1], black_holes[:, 2], c='r', marker='o', label='Black Holes')
+    ax.scatter(other_objects[:, 0], other_objects[:, 1], other_objects[:, 2], c='b', marker='^', label='Other Objects')
+    ax.set_xlabel('X Coordinate')
+    ax.set_ylabel('Y Coordinate')
+    ax.set_zlabel('Z Coordinate')
+    ax.legend()
+    plt.show()
 
-# Reshape the solution to (n, n, 4)
-A_approx = result.x.reshape(n, n, 4)
-print("Approximate Yang-Mills field:")
-print(A_approx)
+# Synthetic data for black holes and other large objects
+num_black_holes = 50
+num_other_objects = 100
+black_holes = np.random.rand(num_black_holes, 3) * 1000  # random positions within a 1000 unit cube
+other_objects = np.random.rand(num_other_objects, 3) * 1000  # random positions within a 1000 unit cube
 
-# Example function using the Quaternion class
-def multiply_quaternions(q1, q2):
-    return q1 * q2
-
-q1 = Quaternion(1, 2, 3, 4)
-q2 = Quaternion(5, 6, 7, 8)
-result = multiply_quaternions(q1, q2)
-print(f"Quaternion multiplication result: {result}")
+# Plot the universe
+plot_universe(black_holes, other_objects)
